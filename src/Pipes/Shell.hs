@@ -8,7 +8,6 @@
 -- The output 'ByteString's from 'pipeCmdEnv' and friends are not line-wise,
 -- but chunk-wise. To get proper lines
 -- use the pipes-bytestring and the upcoming pipes-text machinery.
--- Note that exit code handling is not yet implemented.
 --
 -- All code examples in this module assume following qualified imports:
 -- Pipes.Prelude as P, Pipes.ByteString as PBS, Data.ByteString.Char8 as BSC
@@ -32,7 +31,9 @@ module Pipes.Shell
   , runShell
   ) where
 
+import           Control.Applicative
 import           Control.Monad
+import           Data.Default
 import           Pipes
 import qualified Pipes.ByteString               as PBS
 import           Pipes.Core
@@ -43,6 +44,7 @@ import           Control.Concurrent             hiding (yield)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Concurrent.STM.TBMChan
+import           System.Exit
 import qualified System.IO                      as IO
 import           System.Process
 
@@ -84,19 +86,19 @@ instance MonadSafe m =>
          Cmd (Pipe
               (Maybe BS.ByteString)
               (Either BS.ByteString BS.ByteString)
-              m ()) where
+              m (Maybe ExitCode)) where
   cmdEnv = pipeCmdEnv
 
 instance MonadSafe m =>
          Cmd (Producer
               (Either BS.ByteString BS.ByteString)
-              m ()) where
+              m (Maybe ExitCode)) where
   cmdEnv = producerCmdEnv
 
 instance MonadSafe m =>
          Cmd (Consumer
               (Maybe BS.ByteString)
-              m ()) where
+              m (Maybe ExitCode)) where
   cmdEnv = consumerCmdEnv
 
 
@@ -112,15 +114,15 @@ instance Cmd' cmd => Cmd' (String -> cmd) where
   cmd' binary arg = cmd' $ binary ++ " " ++ arg
 
 instance MonadSafe m =>
-         Cmd' (Pipe (Maybe BS.ByteString) BS.ByteString m ()) where
+         Cmd' (Pipe (Maybe BS.ByteString) BS.ByteString m (Maybe ExitCode)) where
   cmd' = pipeCmd'
 
 instance MonadSafe m =>
-         Cmd' (Producer BS.ByteString m ()) where
+         Cmd' (Producer BS.ByteString m (Maybe ExitCode)) where
   cmd' = producerCmd'
 
 instance MonadSafe m =>
-         Cmd' (Consumer (Maybe BS.ByteString) m ()) where
+         Cmd' (Consumer (Maybe BS.ByteString) m (Maybe ExitCode)) where
   cmd' = consumerCmd
 
 
@@ -136,27 +138,27 @@ instance MonadSafe m =>
 pipeCmdEnv :: MonadSafe m =>
            Maybe [(String,String)] ->
            String ->
-           Pipe (Maybe BS.ByteString) (Either BS.ByteString BS.ByteString) m ()
+           Pipe (Maybe BS.ByteString) (Either BS.ByteString BS.ByteString) m (Maybe ExitCode)
 pipeCmdEnv env' cmdStr = bracket (aquirePipe env' cmdStr) releasePipe $
-  \(stdin, stdout, stderr) -> do
+  \(stdin, stdout, stderr, processHandle) -> do
 
     chan <- liftIO $ newTBMChanIO 4
     _ <- liftIO . forkIO $
       handlesToChan stdout stderr chan
 
-    body stdin chan
+    body stdin chan processHandle
 
   where
-  body stdin chan = do
+  body stdin chan processHandle = do
     got <- await
     case got of
       Nothing -> do
         liftIO $ IO.hClose stdin
-        fromTBMChan chan
+        fromTBMChan chan processHandle
       Just val -> do
         liftIO $ BS.hPutStr stdin val
-        yieldOne chan
-        body stdin chan
+        _ <- Nothing <$ yieldOne chan
+        body stdin chan processHandle
 
   -- *try* to read one line from the chan and yield it.
   yieldOne chan = do
@@ -182,13 +184,13 @@ pipeCmdEnv env' cmdStr = bracket (aquirePipe env' cmdStr) releasePipe $
 -- | Like 'pipeCmdEnv' but doesn't set enviorment varaibles
 pipeCmd :: MonadSafe m =>
            String ->
-           Pipe (Maybe BS.ByteString) (Either BS.ByteString BS.ByteString) m ()
+           Pipe (Maybe BS.ByteString) (Either BS.ByteString BS.ByteString) m (Maybe ExitCode)
 pipeCmd = pipeCmdEnv Nothing
 
 -- | Like 'pipeCmd' but ignores stderr
 pipeCmd' :: MonadSafe m =>
            String ->
-           Pipe (Maybe BS.ByteString) BS.ByteString m ()
+           Pipe (Maybe BS.ByteString) BS.ByteString m (Maybe ExitCode)
 pipeCmd' cmdStr = pipeCmd cmdStr >-> ignoreErr
 
 -- | Like 'pipeCmdEnv' but closes the input end immediately.
@@ -197,19 +199,19 @@ pipeCmd' cmdStr = pipeCmd cmdStr >-> ignoreErr
 producerCmdEnv :: MonadSafe m =>
               Maybe [(String, String)] ->
               String ->
-              Producer (Either BS.ByteString BS.ByteString) m ()
-producerCmdEnv env' cmdStr = yield Nothing >-> pipeCmdEnv env' cmdStr
+              Producer (Either BS.ByteString BS.ByteString) m (Maybe ExitCode)
+producerCmdEnv env' cmdStr = (Nothing <$ yield Nothing) >-> pipeCmdEnv env' cmdStr
 
 -- | Like 'producerCmdEnv' but doesn't set enviorment varaibles
 producerCmd :: MonadSafe m =>
               String ->
-              Producer (Either BS.ByteString BS.ByteString) m ()
+              Producer (Either BS.ByteString BS.ByteString) m (Maybe ExitCode)
 producerCmd = producerCmdEnv Nothing
 
 -- | Like 'producerCmd' but ignores stderr
 producerCmd' :: MonadSafe m =>
               String ->
-              Producer BS.ByteString m ()
+              Producer BS.ByteString m (Maybe ExitCode)
 producerCmd' cmdStr = producerCmd cmdStr >-> ignoreErr
 
 -- | Like 'pipeCmd' but closes the output end immediately.
@@ -218,13 +220,13 @@ producerCmd' cmdStr = producerCmd cmdStr >-> ignoreErr
 consumerCmdEnv :: MonadSafe m =>
               Maybe [(String,String)] ->
               String ->
-              Consumer (Maybe BS.ByteString) m ()
-consumerCmdEnv env' cmdStr = pipeCmdEnv env' cmdStr >-> void await
+              Consumer (Maybe BS.ByteString) m (Maybe ExitCode)
+consumerCmdEnv env' cmdStr = pipeCmdEnv env' cmdStr >-> (Nothing <$ await)
 
 -- | Like 'consumerCmdEnv' but doesn't set enviorment varaibles
 consumerCmd :: MonadSafe m =>
               String ->
-              Consumer (Maybe BS.ByteString) m ()
+              Consumer (Maybe BS.ByteString) m (Maybe ExitCode)
 consumerCmd = consumerCmdEnv Nothing
 
 -- Utils
@@ -256,21 +258,21 @@ markEnd pipe = do
   return result
 
 -- | Ignore stderr from a 'pipeCmd'
-ignoreErr :: (Monad m) =>
-             Pipe (Either BS.ByteString BS.ByteString) BS.ByteString m ()
+ignoreErr :: Monad m => Default r =>
+             Pipe (Either BS.ByteString BS.ByteString) BS.ByteString m r
 ignoreErr = forever $ do
   val <- await
   case val of
-    Left _ -> return ()
+    Left _ -> return def
     Right x -> yield x
 
 -- | Ignore stdout from a 'pipeCmd'
-ignoreOut :: (Monad m) => Pipe (Either BS.ByteString BS.ByteString) BS.ByteString m ()
+ignoreOut :: Monad m => Default r => Pipe (Either BS.ByteString BS.ByteString) BS.ByteString m r
 ignoreOut = forever $ do
   val <- await
   case val of
     Left x -> yield x
-    Right _ -> return ()
+    Right _ -> return def
 
 -- | A simple run function for 'Pipe's that live in 'SafeT' 'IO'
 runShell :: Effect (SafeT IO) r -> IO r
@@ -284,12 +286,15 @@ whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()
 whenJust (Just x) action = action x
 whenJust Nothing _       = return ()
 
-fromTBMChan :: (MonadIO m) => TBMChan a -> Producer' a m ()
-fromTBMChan chan = do
+fromTBMChan :: (MonadIO m) => TBMChan a -> ProcessHandle -> Producer' a m (Maybe ExitCode)
+fromTBMChan chan processHandle = do
   msg <- liftIO $ atomically $ readTBMChan chan
-  whenJust msg $ \m -> do
-    yield m
-    fromTBMChan chan
+  case msg of
+    Just m -> do
+      yield m
+      fromTBMChan chan processHandle
+    Nothing -> do
+      liftIO $ getProcessExitCode processHandle
 
 toTBMChan :: MonadIO m => TBMChan a -> Producer' a m () -> m ()
 toTBMChan chan prod = runEffect $
@@ -299,15 +304,15 @@ toTBMChan chan prod = runEffect $
 aquirePipe :: MonadIO m =>
               Maybe [(String, String)] ->
               String ->
-              m (IO.Handle, IO.Handle, IO.Handle)
+              m (IO.Handle, IO.Handle, IO.Handle, ProcessHandle)
 aquirePipe env' cmdStr = liftIO $ do
-  (Just stdin, Just stdout, Just stderr, _) <-
+  (Just stdin, Just stdout, Just stderr, processHandle) <-
     createProcess (shellPiped env' cmdStr)
-  return (stdin, stdout, stderr)
+  return (stdin, stdout, stderr, processHandle)
 
 -- | Releases the pipe handles
-releasePipe :: MonadIO m => (IO.Handle, IO.Handle, IO.Handle) -> m ()
-releasePipe (stdin, stdout, stderr) = liftIO $ do
+releasePipe :: MonadIO m => (IO.Handle, IO.Handle, IO.Handle, ProcessHandle) -> m ()
+releasePipe (stdin, stdout, stderr, _) = liftIO $ do
   IO.hClose stdin
   IO.hClose stdout
   IO.hClose stderr
